@@ -36,10 +36,13 @@ def kalshi_get(path, params=None):
         json=data,
         timeout=20,
     )
-    if not response.ok:
-    print("Supabase error:", response.status_code, response.text[:1000])
-response.raise_for_status()
-    return response.json() if response.content else []
+        if not response.ok:
+        print(
+            "Supabase error:",
+            response.status_code,
+            response.text[:1000]
+        )
+    response.raise_for_status()
 
 def get_spot():
     response = session.get(COINBASE, timeout=20)
