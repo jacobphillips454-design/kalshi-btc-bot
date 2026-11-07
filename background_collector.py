@@ -23,26 +23,31 @@ def kalshi_get(path, params=None):
     response.raise_for_status()
     return response.json()
 
+    def database_request(method, params=None, data=None):
     headers = {
         "apikey": SUPABASE_KEY,
         "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates",
+        "Prefer": "resolution=merge-duplicates"
     }
+
     response = session.request(
         method,
-        SUPABASE_URL + "/rest/v1/btc_predictions",
+        SUPABASE_URL.rstrip("/") + "/rest/v1/btc_predictions",
         headers=headers,
         params=params,
         json=data,
-        timeout=20,
+        timeout=20
     )
-        if not response.ok:
+
+    if not response.ok:
         print(
             "Supabase error:",
             response.status_code,
             response.text[:1000]
         )
+
     response.raise_for_status()
+    return response.json() if response.content else []
 
 def get_spot():
     response = session.get(COINBASE, timeout=20)
