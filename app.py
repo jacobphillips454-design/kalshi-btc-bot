@@ -138,6 +138,21 @@ def dashboard():
             continue
         close_ts,m=current
         res=evaluate(m,close_ts,spot,closes,edge)
+        
+        # Directional forecast independent of paper-trade decision
+        p_up = res.get('p')
+        if p_up is None and 'strike' in res and res.get('left', 0) > 0:
+            p_up = probability(spot, res['strike'], res['left'], closes)
+        if p_up is not None:
+            direction = 'UP' if p_up >= 0.5 else 'DOWN'
+            confidence = p_up if direction == 'UP' else 1 - p_up
+            st.markdown(f"## {'🟢' if direction == 'UP' else '🔴'} BTC PREDICTION: {direction}")
+            st.metric('Estimated direction probability', f'{confidence:.1%}')
+            st.caption(f'Model: UP {p_up:.1%} | DOWN {1-p_up:.1%}')
+            st.caption('Illustrative model estimate — not a validated forecast')
+        else:
+            st.warning('Direction unavailable: insufficient market data')
+  
         st.write('Market:',m['ticker'],'|',res['signal'],'|',res['reason'])
         a,b,c,d=st.columns(4)
         a.metric('Target',f"${res['strike']:,.2f}" if 'strike' in res else 'Unavailable')
