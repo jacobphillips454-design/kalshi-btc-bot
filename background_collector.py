@@ -37,7 +37,9 @@ def database_request(method, params=None, data=None):
         json=data,
         timeout=20,
     )
-    response.raise_for_status()
+    if not response.ok:
+    print("Supabase error:", response.status_code, response.text[:1000])
+response.raise_for_status()
     return response.json() if response.content else []
 
 def get_spot():
