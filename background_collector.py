@@ -23,8 +23,7 @@ def kalshi_get(path, params=None):
     response.raise_for_status()
     return response.json()
 
-def database_request(method, params=None, data=None):
-        headers = {
+    headers = {
         "apikey": SUPABASE_KEY,
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates",
