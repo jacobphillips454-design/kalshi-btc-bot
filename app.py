@@ -116,11 +116,11 @@ st.set_page_config(page_title='Kalshi BTC Paper Signals',page_icon='₿',layout=
 st.title('₿ Kalshi BTC 15-Minute — Paper Signals')
 st.caption('READ ONLY · NO REAL ORDERS · BTC spot is Coinbase proxy, not the Kalshi settlement index · illustrative model, not validated')
 edge=st.sidebar.slider('Minimum estimated edge after fees',0.01,0.25,0.10,0.01)
-st.sidebar.write('Refresh: every 30 seconds while this dashboard is open. One paper entry per market. Default 1 contract.')
+st.sidebar.write(f'Refresh target: every {REFRESH} second(s) while open; network requests may take longer. One paper entry per market.')
 st.sidebar.info('Stage 1: stable REST-only baseline. No WebSocket, API keys, or live execution. More advanced features require measured out-of-sample validation.')
 st.sidebar.warning('For 24/7 recording, use an always-on paid host and an independent scheduler/worker. This dashboard alone does not record while asleep.')
 
-@st.fragment(run_every='30s')
+@st.fragment(run_every=f'{REFRESH}s')
 def dashboard():
     con=connect()
     settle(con)
@@ -179,4 +179,3 @@ def dashboard():
     con.close()
 
 dashboard()
-
