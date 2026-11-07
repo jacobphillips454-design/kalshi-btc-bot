@@ -1,124 +1,97 @@
-"""Read-only websocket price cache. No order endpoints are used."""
-import base64
-import json
-import os
-import threading
-import time
+"""Best-effort in-process WebSocket feeds. Read-only; no order endpoints."""
+import json, os, threading, time
+from collections import deque
 from datetime import datetime, timezone
-
 import requests
 import websocket
 
-COINBASE_WS = 'wss://ws-feed.exchange.coinbase.com'
-KALSHI_WS = 'wss://api.elections.kalshi.com/trade-api/ws/v2'
-KALSHI_API = 'https://external-api.kalshi.com/trade-api/v2'
-
-class LiveFeed:
-    def __init__(self, key_id='', private_key=''):
-        self.lock = threading.RLock()
-        self.price = None
-        self.price_at = 0
-        self.kalshi = {}
-        self.kalshi_at = {}
-        self.active_ticker = None
-        self.status = {'coinbase': 'connecting', 'kalshi': 'not configured'}
-        self.key_id, self.private_key = key_id, private_key
-        threading.Thread(target=self._coinbase_loop, daemon=True).start()
-        if key_id and private_key:
-            threading.Thread(target=self._kalshi_loop, daemon=True).start()
-
-    def snapshot(self):
+class Feeds:
+    def __init__(self):
+        self.lock=threading.RLock()
+        self.btc=None; self.btc_at=0; self.kalshi={}; self.kalshi_at={}
+        self.trades=deque(maxlen=1800); self.status={'coinbase':'connecting','kalshi':'not configured'}
+        self.started=False; self.subscribed=set(); self.kalshi_ws=None
+    def start(self):
         with self.lock:
-            return dict(price=self.price, price_at=self.price_at,
-                        kalshi={k: dict(v) for k,v in self.kalshi.items()},
-                        kalshi_at=dict(self.kalshi_at), active_ticker=self.active_ticker,
-                        status=dict(self.status))
-
+            if self.started:return
+            self.started=True
+        threading.Thread(target=self._coinbase_loop,daemon=True).start()
+        if os.getenv('KALSHI_API_KEY_ID') and os.getenv('KALSHI_PRIVATE_KEY'):
+            threading.Thread(target=self._kalshi_loop,daemon=True).start()
+    def subscribe(self,ticker):
+        with self.lock:
+            if ticker in self.subscribed:return
+            self.subscribed.add(ticker)
+            ws=self.kalshi_ws
+        if ws:
+            try:ws.send(json.dumps({'id':int(time.time()),'cmd':'subscribe','params':{'channels':['ticker'],'market_tickers':[ticker]}}))
+            except Exception:pass
+    def market_snapshot(self,ticker):
+        with self.lock:
+            age=time.time()-self.kalshi_at[ticker] if ticker in self.kalshi_at else None
+            return dict(self.kalshi.get(ticker,{})),age
     def _coinbase_loop(self):
-        backoff = 1
         while True:
+            def on_open(ws):
+                ws.send(json.dumps({'type':'subscribe','product_ids':['BTC-USD'],'channels':['ticker']}))
+                with self.lock:self.status['coinbase']='connected'
+            def on_message(ws,raw):
+                try:
+                    m=json.loads(raw)
+                    if m.get('type')!='ticker':return
+                    price=float(m['price']); now=time.time()
+                    with self.lock:
+                        self.btc=price;self.btc_at=now;self.trades.append((now,price))
+                except (ValueError,KeyError,TypeError):pass
+            def on_error(ws,e):
+                with self.lock:self.status['coinbase']='error: '+str(e)[:90]
+            def on_close(ws,*args):
+                with self.lock:self.status['coinbase']='disconnected'
             try:
-                def opened(ws):
-                    ws.send(json.dumps({'type':'subscribe','product_ids':['BTC-USD'], 'channels':['ticker']}))
-                    with self.lock: self.status['coinbase']='connected'
-                def message(ws, raw):
-                    msg=json.loads(raw)
-                    if msg.get('type')=='ticker' and msg.get('product_id')=='BTC-USD':
-                        try: price=float(msg['price'])
-                        except (ValueError, TypeError, KeyError): return
-                        with self.lock:
-                            self.price=price
-                            self.price_at=time.time()
-                ws=websocket.WebSocketApp(COINBASE_WS, on_open=opened, on_message=message)
-                ws.run_forever(ping_interval=25, ping_timeout=10)
-            except Exception:
-                pass
-            with self.lock: self.status['coinbase']='reconnecting'
-            time.sleep(backoff)
-            backoff=min(backoff*2, 30)
-
-    def _auth_headers(self):
+                websocket.WebSocketApp('wss://ws-feed.exchange.coinbase.com',on_open=on_open,on_message=on_message,on_error=on_error,on_close=on_close).run_forever(ping_interval=25,ping_timeout=10)
+            except Exception as e:
+                with self.lock:self.status['coinbase']='error: '+str(e)[:90]
+            time.sleep(3)
+    def _kalshi_loop(self):
+        # Authentication uses Kalshi's RSA-PSS signing scheme. Credentials from server environment only.
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import padding
-        key=serialization.load_pem_private_key(self.private_key.replace('\\n','\n').encode(), password=None)
-        ts=str(int(time.time()*1000))
-        payload=(ts+'GET'+'/trade-api/ws/v2').encode()
-        signature=key.sign(payload, padding.PSS(mgf=padding.MGF1(hashes.SHA256()),salt_length=padding.PSS.DIGEST_LENGTH),hashes.SHA256())
-        return [f'KALSHI-ACCESS-KEY: {self.key_id}',f'KALSHI-ACCESS-TIMESTAMP: {ts}',f'KALSHI-ACCESS-SIGNATURE: {base64.b64encode(signature).decode()}']
-
-    def _watch_markets(self, ws):
-        def watcher():
-            counter=1
-            previous=None
-            while ws.sock and ws.sock.connected:
-                try:
-                    response=requests.get(KALSHI_API+'/markets', params={
-                        'series_ticker':'KXBTC15M','status':'open','limit':30},timeout=8)
-                    response.raise_for_status()
-                    now=time.time()
-                    candidates=[]
-                    for m in response.json().get('markets',[]):
-                        close=m.get('close_time') or m.get('expiration_time')
-                        if not close: continue
-                        ts=datetime.fromisoformat(close.replace('Z','+00:00')).timestamp()
-                        if ts>now: candidates.append((ts,m['ticker']))
-                    if candidates:
-                        ticker=min(candidates)[1]
-                        if ticker!=previous:
-                            counter+=1
-                            ws.send(json.dumps({'id':counter,'cmd':'subscribe',
-                                'params':{'channels':['ticker'],'market_tickers':[ticker]}}))
-                            previous=ticker
-                            with self.lock: self.active_ticker=ticker
-                except Exception as exc:
-                    with self.lock: self.status['kalshi']='market discovery retrying: '+str(exc)[:70]
-                time.sleep(15)
-        threading.Thread(target=watcher, daemon=True).start()
-
-    def _kalshi_loop(self):
-        backoff=1
+        key_id=os.environ['KALSHI_API_KEY_ID']
+        private=serialization.load_pem_private_key(os.environ['KALSHI_PRIVATE_KEY'].replace('\\n','\n').encode(),password=None)
+        path='/trade-api/ws/v2'
         while True:
+            timestamp=str(int(time.time()*1000))
+            signature=private.sign((timestamp+'GET'+path).encode(),padding.PSS(mgf=padding.MGF1(hashes.SHA256()),salt_length=padding.PSS.DIGEST_LENGTH),hashes.SHA256())
+            import base64
+            headers=[f'KALSHI-ACCESS-KEY: {key_id}',f'KALSHI-ACCESS-TIMESTAMP: {timestamp}',f'KALSHI-ACCESS-SIGNATURE: {base64.b64encode(signature).decode()}']
+            def on_open(ws):
+                with self.lock:
+                    self.status['kalshi']='connected';self.kalshi_ws=ws
+                # Subscribe to series ticker updates. API may reject series subscriptions; REST remains authoritative fallback.
+                ws.send(json.dumps({'id':1,'cmd':'subscribe','params':{'channels':['ticker'],'market_tickers':list(self.subscribed)}})) if self.subscribed else None
+            def on_message(ws,raw):
+                try:
+                    m=json.loads(raw);msg=m.get('msg') or {}
+                    ticker=msg.get('market_ticker') or msg.get('ticker')
+                    if ticker and m.get('type')=='ticker':
+                        with self.lock:self.kalshi[ticker]=msg;self.kalshi_at[ticker]=time.time()
+                    if m.get('type')=='error':
+                        with self.lock:self.status['kalshi']='subscription error: '+str(msg)[:100]
+                except (ValueError,TypeError):pass
+            def on_error(ws,e):
+                with self.lock:self.status['kalshi']='error: '+str(e)[:90]
+            def on_close(ws,*args):
+                with self.lock:
+                    self.status['kalshi']='disconnected';self.kalshi_ws=None
             try:
-                headers=self._auth_headers()
-                def opened(ws):
-                    with self.lock: self.status['kalshi']='connected'
-                    # Subscribe to the currently open 15-minute contract.
-                    self._watch_markets(ws)
-                def message(ws, raw):
-                    msg=json.loads(raw)
-                    if msg.get('type')=='error':
-                        with self.lock: self.status['kalshi']='subscription error: '+str(msg.get('msg',''))[:120]
-                        return
-                    if msg.get('type')!='ticker': return
-                    m=msg.get('msg') or {}
-                    ticker=m.get('market_ticker') or m.get('ticker')
-                    if not ticker or not ticker.startswith('KXBTC15M-'): return
-                    with self.lock:
-                        self.kalshi[ticker]=dict(m)
-                        self.kalshi_at[ticker]=time.time()
-                ws=websocket.WebSocketApp(KALSHI_WS,header=headers,on_open=opened,on_message=message)
-                ws.run_forever(ping_interval=25,ping_timeout=10)
-            except Exception as exc:
-                with self.lock: self.status['kalshi']='reconnecting: '+str(exc)[:80]
-            time.sleep(backoff)
-            backoff=min(backoff*2,30)
+                websocket.WebSocketApp('wss://external-api.kalshi.com'+path,header=headers,on_open=on_open,on_message=on_message,on_error=on_error,on_close=on_close).run_forever(ping_interval=25,ping_timeout=10)
+            except Exception as e:
+                with self.lock:self.status['kalshi']='error: '+str(e)[:90]
+            time.sleep(5)
+    def snapshot(self):
+        with self.lock:return {'btc':self.btc,'btc_age':time.time()-self.btc_at if self.btc_at else None,'status':dict(self.status),'trades':list(self.trades)}
+
+_FEED=Feeds()
+def feeds():
+    _FEED.start()
+    return _FEED
