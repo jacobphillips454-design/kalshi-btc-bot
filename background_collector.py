@@ -24,11 +24,10 @@ def kalshi_get(path, params=None):
     return response.json()
 
 def database_request(method, params=None, data=None):
-    headers = {
+        headers = {
         "apikey": SUPABASE_KEY,
-        "Authorization": "Bearer " + SUPABASE_KEY,
         "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates,return=minimal",
+        "Prefer": "resolution=merge-duplicates",
     }
     response = session.request(
         method,
