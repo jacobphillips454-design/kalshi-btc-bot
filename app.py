@@ -3,13 +3,11 @@ from datetime import datetime, timezone
 import requests
 import streamlit as st
 import pandas as pd
-from live_feeds import feeds
-from signal_charts import log_signal, show_charts
 
 API='https://external-api.kalshi.com/trade-api/v2'
 DB=os.getenv('DB_PATH','signals.db')
 SERIES=['KXBTC15M']
-REFRESH=2
+REFRESH=30
 
 def get(url,params=None):
     r=requests.get(url,params=params,timeout=12,headers={'User-Agent':'BTC-Paper-Dashboard/1.0'})
@@ -115,53 +113,32 @@ def settle(con):
         except (requests.RequestException,ValueError):pass
 
 st.set_page_config(page_title='Kalshi BTC Paper Signals',page_icon='₿',layout='wide')
-st.title('₿ Kalshi BTC — Paper Signal Dashboard')
+st.title('₿ Kalshi BTC 15-Minute — Paper Signals')
 st.caption('READ ONLY · NO REAL ORDERS · BTC spot is Coinbase proxy, not the Kalshi settlement index · illustrative model, not validated')
 edge=st.sidebar.slider('Minimum estimated edge after fees',0.01,0.25,0.10,0.01)
-st.sidebar.write('Display refresh: ~2 seconds while open. One paper entry per market. Default 1 contract.')
+st.sidebar.write('Refresh: every 30 seconds while this dashboard is open. One paper entry per market. Default 1 contract.')
+st.sidebar.info('Stage 1: stable REST-only baseline. No WebSocket, API keys, or live execution. More advanced features require measured out-of-sample validation.')
 st.sidebar.warning('For 24/7 recording, use an always-on paid host and an independent scheduler/worker. This dashboard alone does not record while asleep.')
 
-@st.fragment(run_every='2s')
+@st.fragment(run_every='30s')
 def dashboard():
     con=connect()
-    # Avoid repeated settlement HTTP calls every two seconds.
-    now=time.time()
-    if now-st.session_state.get('last_settle',0)>30:
-        settle(con)
-        st.session_state['last_settle']=now
-    live=feeds().snapshot()
-    st.caption('Coinbase WebSocket: '+live['status']['coinbase']+' | Kalshi WebSocket: '+live['status']['kalshi'])
-    try:spot,closes=spot_data_cached()
+    settle(con)
+    try:spot,closes=spot_data()
     except Exception as e:
         st.error(f'BTC feed unavailable: {e}. No signal generated.');con.close();return
-    if live['btc'] is not None and live['btc_age'] is not None and live['btc_age']<10:
-        spot=live['btc']
-    else:
-        st.warning('Live BTC ticker stale; using recent REST spot proxy. Check feed connection.')
     st.metric('Coinbase BTC/USD (proxy)',f'${spot:,.2f}')
-    st.caption('Live ticker age: '+(f"{live['btc_age']:.1f}s" if live['btc_age'] is not None else 'unavailable'))
     st.line_chart(pd.DataFrame({'BTC/USD':closes}))
     for series in SERIES:
-        st.subheader(series+' — '+('15-minute' if series.endswith('15M') else '5-minute'))
-        try:current=market_data_cached(series)
+        st.subheader('BTC 15-minute contract')
+        try:current=market_data(series)
         except Exception as e:
             st.warning(f'Kalshi feed unavailable: {e}');continue
         if not current:
             st.info('No currently open market found. This series may not be listed. No simulated 5-minute contract is substituted.')
             continue
         close_ts,m=current
-        feed=feeds()
-        feed.subscribe(m['ticker'])
-        tick,age=feed.market_snapshot(m['ticker'])
-        # Only use a recent WebSocket quote if it has the expected executable ask fields.
-        if age is not None and age<8:
-            for k in ('yes_ask_dollars','no_ask_dollars','yes_ask','no_ask','yes_bid_dollars','no_bid_dollars'):
-                if k in tick:m[k]=tick[k]
-        st.caption('Kalshi quote feed: '+(f'WebSocket {age:.1f}s old' if age is not None and age<8 else 'REST fallback (up to 5s cached)'))
         res=evaluate(m,close_ts,spot,closes,edge)
-        if now-st.session_state.get('last_history',0)>=10:
-            log_signal(con,m['ticker'],series,res,spot)
-            st.session_state['last_history']=now
         
         # Directional forecast independent of paper-trade decision
         p_up = res.get('p')
@@ -173,7 +150,7 @@ def dashboard():
             st.markdown(f"## {'🟢' if direction == 'UP' else '🔴'} BTC PREDICTION: {direction}")
             st.metric('Estimated direction probability', f'{confidence:.1%}')
             st.caption(f'Model: UP {p_up:.1%} | DOWN {1-p_up:.1%}')
-            st.caption('Illustrative model estimate — not a validated forecast')
+            st.caption('Illustrative model estimate — not a validated forecast. No accuracy claim until backtested.')
         else:
             st.warning('Direction unavailable: insufficient market data')
   
@@ -201,22 +178,5 @@ def dashboard():
     st.caption('Last refresh: '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'))
     con.close()
 
-@st.cache_data(ttl=15,show_spinner=False)
-def spot_data_cached():
-    return spot_data()
-
-@st.cache_data(ttl=5,show_spinner=False)
-def market_data_cached(series):
-    return market_data(series)
-
 dashboard()
-
-@st.fragment(run_every='15s')
-def charts_panel():
-    with st.expander('Candlesticks, indicators and probability history'):
-        con=connect()
-        try:show_charts(con)
-        finally:con.close()
-
-charts_panel()
 
