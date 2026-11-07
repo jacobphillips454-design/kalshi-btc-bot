@@ -7,7 +7,7 @@ import pandas as pd
 API='https://external-api.kalshi.com/trade-api/v2'
 DB=os.getenv('DB_PATH','signals.db')
 SERIES=['KXBTC15M']
-REFRESH=30
+REFRESH=1
 
 def get(url,params=None):
     r=requests.get(url,params=params,timeout=12,headers={'User-Agent':'BTC-Paper-Dashboard/1.0'})
