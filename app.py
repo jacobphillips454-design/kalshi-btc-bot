@@ -38,6 +38,7 @@ def fee(price,contracts=1):
 def connect():
     con=sqlite3.connect(DB,timeout=15)
     con.execute('CREATE TABLE IF NOT EXISTS paper (ticker TEXT PRIMARY KEY, series TEXT, side TEXT, entry REAL, fee REAL, strike REAL, spot REAL, created INTEGER, close_ts INTEGER, status TEXT DEFAULT "OPEN", result TEXT, pnl REAL)')
+    con.execute('''CREATE TABLE IF NOT EXISTS forecasts (ticker TEXT PRIMARY KEY, predicted_at INTEGER NOT NULL, close_ts INTEGER NOT NULL, seconds_left INTEGER NOT NULL, p_up REAL NOT NULL, direction TEXT NOT NULL, strike REAL NOT NULL, proxy_spot REAL NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN', result TEXT, correct INTEGER, brier REAL)''')
     con.commit();return con
 
 def market_data(series):
@@ -112,6 +113,38 @@ def settle(con):
             con.commit()
         except (requests.RequestException,ValueError):pass
 
+def record_forecast(con,ticker,res,spot,close_ts):
+    # One immutable forecast per contract, captured when 5-10 minutes remain.
+    # No later edits or cherry-picking of a better prediction.
+    p=res.get('p')
+    left=res.get('left')
+    if p is None or left is None or not (300 <= left <= 600):
+        return False
+    direction='UP' if p >= .5 else 'DOWN'
+    cur=con.execute('INSERT OR IGNORE INTO forecasts (ticker,predicted_at,close_ts,seconds_left,p_up,direction,strike,proxy_spot) VALUES (?,?,?,?,?,?,?,?)',
+                    (ticker,int(time.time()),int(close_ts),left,p,direction,res['strike'],spot))
+    con.commit()
+    return cur.rowcount > 0
+
+def settle_forecasts(con):
+    rows=con.execute('SELECT ticker,p_up,direction FROM forecasts WHERE status="OPEN" AND close_ts<?',(int(time.time())-30,)).fetchall()
+    for ticker,p_up,direction in rows:
+        try:
+            data=get(API+'/markets/'+ticker).get('market',{})
+            result=str(data.get('result') or '').lower()
+            if result not in ('yes','no'):
+                data=get(API+'/historical/markets/'+ticker).get('market',{})
+                result=str(data.get('result') or '').lower()
+            if result not in ('yes','no'): continue
+            actual=1 if result=='yes' else 0
+            correct=int((direction=='UP')==bool(actual))
+            brier=(p_up-actual)**2
+            con.execute('UPDATE forecasts SET status="SETTLED",result=?,correct=?,brier=? WHERE ticker=?',
+                        (result,correct,brier,ticker))
+            con.commit()
+        except (requests.RequestException,ValueError,KeyError):
+            pass
+
 st.set_page_config(page_title='Kalshi BTC Paper Signals',page_icon='₿',layout='wide')
 st.title('₿ Kalshi BTC 15-Minute — Paper Signals')
 st.caption('READ ONLY · NO REAL ORDERS · BTC spot is Coinbase proxy, not the Kalshi settlement index · illustrative model, not validated')
@@ -124,6 +157,7 @@ st.sidebar.warning('For 24/7 recording, use an always-on paid host and an indepe
 def dashboard():
     con=connect()
     settle(con)
+    settle_forecasts(con)
     try:spot,closes=spot_data()
     except Exception as e:
         st.error(f'BTC feed unavailable: {e}. No signal generated.');con.close();return
@@ -162,6 +196,8 @@ def dashboard():
         d.metric('DOWN ask',f"{res['asks']['DOWN']:.0%}" if 'asks' in res else '—')
         if 'p' in res:
             st.write(f"Model UP probability: {res['p']:.1%} | UP net edge: {res['edges']['UP']:+.1%} | DOWN net edge: {res['edges']['DOWN']:+.1%}")
+        if record_forecast(con,m['ticker'],res,spot,close_ts):
+            st.success('Accuracy forecast saved for this market (5–10 minutes remaining)')
         if res['signal']!='SKIP':
             if record(con,m['ticker'],series,res,spot,close_ts):st.success('New one-contract simulated paper entry recorded')
     df=pd.read_sql_query('SELECT ticker,series,side,entry,fee,status,result,pnl,datetime(created,"unixepoch") AS entered_utc FROM paper ORDER BY created DESC LIMIT 150',con)
@@ -175,7 +211,24 @@ def dashboard():
         st.dataframe(df,use_container_width=True,hide_index=True)
         st.download_button('Export paper trades CSV',df.to_csv(index=False),'paper_trades.csv','text/csv')
     else:st.info('No simulated trades yet. SKIP is normal and preferred when data is insufficient.')
+    st.subheader('Prediction accuracy — official settled markets')
+    st.caption('One locked forecast per 15-minute contract, first observed with 5–10 minutes left. Recorded even when paper trade says SKIP. Results use official Kalshi YES/NO outcomes.')
+    forecasts=pd.read_sql_query('SELECT ticker, direction, p_up, seconds_left, status, result, correct, brier, datetime(predicted_at,"unixepoch") AS predicted_utc FROM forecasts ORDER BY predicted_at DESC LIMIT 500',con)
+    done=forecasts[forecasts.status=='SETTLED']
+    x,y,z=st.columns(3)
+    x.metric('Settled forecasts',len(done))
+    y.metric('Directional accuracy',f"{done.correct.mean():.1%}" if len(done) else '—')
+    z.metric('Brier score (lower is better)',f"{done.brier.mean():.3f}" if len(done) else '—')
+    if len(done):
+        st.caption('Baseline Brier score for always predicting 50%: 0.250. Accuracy alone does not measure profitability.')
+    if len(forecasts):
+        st.dataframe(forecasts,use_container_width=True,hide_index=True)
+        st.download_button('Export forecast accuracy CSV',forecasts.to_csv(index=False),'btc_forecast_accuracy.csv','text/csv',key='export_forecasts')
+    else:
+        st.info('Waiting to observe a contract with 5–10 minutes remaining. Leave the dashboard open to capture forecasts.')
+    st.warning('Streamlit Community Cloud local SQLite storage can reset on redeploy/restart. Export the CSV regularly; this is not durable 24/7 tracking.')
     st.caption('Last refresh: '+datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'))
     con.close()
 
 dashboard()
+
