@@ -1,4 +1,7 @@
-streamlit
+streamlit>=1.37
 requests
 pandas
 altair
+plotly
+websocket-client
+cryptography
